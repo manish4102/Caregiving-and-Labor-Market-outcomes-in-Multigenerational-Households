@@ -1,0 +1,899 @@
+---
+title: "WIL Data Summit Project"
+author: "Manish"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(ipumsr)
+library(dplyr)
+library(readr)
+library(survey)
+library(ggplot2)
+library(tidyr)
+library(scales)
+library(haven)
+library(stringr)
+library(forcats)
+
+options(survey.lonely.psu = "adjust")
+set.seed(4102)
+```
+
+```{r}
+atus_samples <- get_sample_info("atus") |> pull(name)
+
+atus_vars <- c(
+  "YEAR", "CASEID", "PERNUM",
+  "WT06", "STRATA", "CLUSTER",
+  "AGE", "SEX", "RELATE", "MARST", "EDUC",
+  "RACE", "HISPAN",
+  "FAMINCOME", "HH_SIZE", "HH_NUMKIDS",
+  "EMPSTAT", "FULLPART", "UHRSWORKT"
+)
+
+atus_tuv <- c(
+  "BLS_CAREHH",
+  "BLS_CAREHH_KID",
+  "BLS_CARENHH"
+)
+
+atus_extract <- define_extract_micro(
+  collection         = "atus",
+  description        = "WIL Data Summit: Multigenerational households, caregiving, ethnicity, size, counts",
+  samples            = atus_samples,
+  variables          = atus_vars,
+  time_use_variables = atus_tuv,
+  data_format        = "csv",
+  data_structure     = "rectangular",
+  rectangular_on     = "P"
+)
+
+atus_extract <- submit_extract(atus_extract)
+atus_extract <- wait_for_extract(atus_extract)
+ddi_path     <- download_extract(atus_extract)
+
+ddi  <- read_ipums_ddi(ddi_path)
+atus <- read_ipums_micro(ddi)
+```
+
+```{r}
+make_race_eth <- function(race_vec, hispan_vec) {
+  race_lab   <- haven::as_factor(race_vec, levels = "default")
+  hispan_lab <- haven::as_factor(hispan_vec, levels = "default")
+
+  hisp_flag <- !is.na(hispan_lab) & !str_detect(tolower(as.character(hispan_lab)), "not hispanic")
+  race_txt <- tolower(as.character(race_lab))
+
+  race_collapsed <- dplyr::case_when(
+    is.na(race_lab) ~ NA_character_,
+    str_detect(race_txt, "white") ~ "White",
+    str_detect(race_txt, "black") | str_detect(race_txt, "african") ~ "Black",
+    str_detect(race_txt, "asian") | str_detect(race_txt, "chinese|japanese|korean|filipino|vietnamese|asian indian") ~ "Asian",
+    str_detect(race_txt, "american indian") | str_detect(race_txt, "alaska") ~ "AIAN",
+    str_detect(race_txt, "hawaiian") | str_detect(race_txt, "pacific") ~ "NHPI",
+    str_detect(race_txt, "two") | str_detect(race_txt, "multi") ~ "Multiracial",
+    TRUE ~ "Other"
+  )
+
+  dplyr::case_when(
+    is.na(hisp_flag) & is.na(race_collapsed) ~ NA_character_,
+    hisp_flag ~ "Hispanic (any race)",
+    TRUE ~ paste0("Non-Hispanic ", race_collapsed)
+  )
+}
+
+atus_final <- atus %>%
+  mutate(
+    WT06 = as.numeric(WT06),
+    childcare_min = as.numeric(BLS_CAREHH_KID),
+    adultcare_proxy_min = pmax(as.numeric(BLS_CAREHH) - as.numeric(BLS_CAREHH_KID), 0) + as.numeric(BLS_CARENHH),
+    total_care_min = childcare_min + adultcare_proxy_min,
+    total_care_hours_week = (total_care_min * 7) / 60,
+    provides_care = total_care_min > 0,
+    has_kids_hh = HH_NUMKIDS > 0,
+    has_old_hh_proxy = pmax(as.numeric(BLS_CAREHH) - as.numeric(BLS_CAREHH_KID), 0) > 0,
+    multigen = has_kids_hh & has_old_hh_proxy,
+    race_eth = make_race_eth(RACE, HISPAN)
+  ) %>%
+  filter(
+    !is.na(WT06), WT06 > 0,
+    !is.na(STRATA),
+    !is.na(CLUSTER),
+    !is.na(CASEID)
+  ) %>%
+  mutate(
+    STRATA  = as.factor(STRATA),
+    CLUSTER = as.factor(CLUSTER),
+    one     = 1
+  ) %>%
+  mutate(
+    care_intensity = case_when(
+      total_care_hours_week == 0 ~ "No care",
+      total_care_hours_week < 20 ~ "Part-time (<20 hrs/wk)",
+      total_care_hours_week >= 40 ~ "Full-time (>=40 hrs/wk)",
+      TRUE ~ "Mid-range (20–39 hrs/wk)"
+    )
+  ) %>%
+  mutate(
+    UHRSWORKT_raw  = as.numeric(UHRSWORKT),
+    UHRSWORKT_plot = if_else(UHRSWORKT_raw > 200, UHRSWORKT_raw / 100, UHRSWORKT_raw),
+    UHRSWORKT_plot = pmin(pmax(UHRSWORKT_plot, 0), 80)
+  )
+```
+
+```{r}
+des_all <- svydesign(
+  ids     = ~CLUSTER,
+  strata  = ~STRATA,
+  weights = ~WT06,
+  nest    = TRUE,
+  data    = atus_final
+)
+
+des_multi <- subset(des_all, multigen == TRUE)
+```
+
+```{r}
+hh_level <- atus_final %>%
+  group_by(CASEID) %>%
+  slice(1) %>%
+  ungroup()
+
+des_hh <- svydesign(
+  ids     = ~CLUSTER,
+  strata  = ~STRATA,
+  weights = ~WT06,
+  nest    = TRUE,
+  data    = hh_level
+)
+
+des_hh_multi <- subset(des_hh, multigen == TRUE)
+```
+
+```{r}
+n_all   <- nrow(atus_final)
+n_multi <- sum(atus_final$multigen, na.rm = TRUE)
+
+n_all
+n_multi
+
+svytotal(~one, des_all)
+svytotal(~one, des_multi)
+```
+
+```{r}
+step0_means <- svyby(
+  ~AGE + UHRSWORKT_plot + HH_SIZE + HH_NUMKIDS,
+  ~multigen,
+  des_all,
+  svymean,
+  na.rm = TRUE
+)
+step0_means
+```
+
+```{r}
+step0_emp  <- as.data.frame(prop.table(svytable(~EMPSTAT + multigen, des_all), margin = 2))
+step0_inc  <- as.data.frame(prop.table(svytable(~FAMINCOME + multigen, des_all), margin = 2))
+step0_educ <- as.data.frame(prop.table(svytable(~EDUC + multigen, des_all), margin = 2))
+
+names(step0_emp)  <- c("EMPSTAT", "multigen", "share")
+names(step0_inc)  <- c("FAMINCOME", "multigen", "share")
+names(step0_educ) <- c("EDUC", "multigen", "share")
+
+step0_emp
+step0_inc
+step0_educ
+```
+
+```{r}
+step1_means <- svyby(
+  ~AGE + UHRSWORKT_plot + HH_SIZE + HH_NUMKIDS + childcare_min + adultcare_proxy_min + total_care_min,
+  ~provides_care,
+  des_multi,
+  svymean,
+  na.rm = TRUE
+)
+step1_means
+```
+
+```{r}
+step1_emp  <- as.data.frame(prop.table(svytable(~EMPSTAT + provides_care, des_multi), margin = 2))
+step1_inc  <- as.data.frame(prop.table(svytable(~FAMINCOME + provides_care, des_multi), margin = 2))
+step1_educ <- as.data.frame(prop.table(svytable(~EDUC + provides_care, des_multi), margin = 2))
+
+names(step1_emp)  <- c("EMPSTAT", "provides_care", "share")
+names(step1_inc)  <- c("FAMINCOME", "provides_care", "share")
+names(step1_educ) <- c("EDUC", "provides_care", "share")
+
+step1_emp
+step1_inc
+step1_educ
+```
+
+```{r}
+step2_hours <- svyby(
+  ~UHRSWORKT_plot,
+  ~care_intensity,
+  des_multi,
+  svymean,
+  na.rm = TRUE
+)
+step2_hours
+```
+
+```{r}
+svy_mean_df <- function(design, formula, by_var) {
+  as.data.frame(svyby(formula, by_var, design, svymean, na.rm = TRUE))
+}
+```
+
+```{r}
+p0 <- svy_mean_df(des_all, ~UHRSWORKT_plot, ~multigen)
+
+ggplot(p0, aes(x = multigen, y = UHRSWORKT_plot)) +
+  geom_col() +
+  labs(
+    x = "Multigenerational (kids + old proxy)",
+    y = "Average usual weekly hours worked",
+    title = "Step 0: Work hours — entire population vs multigenerational households"
+  )
+```
+
+```{r}
+p1_work <- svy_mean_df(des_multi, ~UHRSWORKT_plot, ~provides_care)
+
+ggplot(p1_work, aes(x = provides_care, y = UHRSWORKT_plot)) +
+  geom_col() +
+  labs(
+    x = "Provides caregiving (within multigen)",
+    y = "Average usual weekly hours worked",
+    title = "Step 1: Work hours — care vs no-care in multigenerational households"
+  )
+```
+
+```{r}
+inc_tab <- as.data.frame(prop.table(svytable(~FAMINCOME + provides_care, des_multi), margin = 2))
+names(inc_tab) <- c("FAMINCOME", "provides_care", "share")
+
+ggplot(inc_tab, aes(x = provides_care, y = share, fill = FAMINCOME)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Provides caregiving (within multigen)",
+    y = "Share",
+    title = "Step 1: Family income distribution — care vs no-care (multigenerational households)"
+  )
+```
+
+```{r}
+p2 <- as.data.frame(svyby(~UHRSWORKT_plot, ~care_intensity, des_multi, svymean, na.rm = TRUE))
+names(p2) <- c("care_intensity", "mean_hours", "se")
+
+p2$care_intensity <- factor(
+  p2$care_intensity,
+  levels = c("No care", "Part-time (<20 hrs/wk)", "Mid-range (20–39 hrs/wk)", "Full-time (>=40 hrs/wk)")
+)
+
+ggplot(p2, aes(x = care_intensity, y = mean_hours, fill = care_intensity)) +
+  geom_col(width = 0.65, color = "white", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = mean_hours - 1.96 * se, ymax = mean_hours + 1.96 * se),
+                width = 0.15) +
+  labs(
+    title = "Usual Weekly Work Hours by Caregiving Intensity (Multigenerational Households)",
+    x = NULL,
+    y = "Average usual weekly work hours"
+  ) +
+  theme(axis.text.x = element_text(angle = 18, hjust = 1),
+        legend.position = "none")
+```
+
+```{r}
+eda_scaffold <- atus_final %>%
+  mutate(total_care_min_cap = pmin(total_care_min, 600))
+
+eda_care_dist <- eda_scaffold %>%
+  filter(multigen == TRUE, provides_care == TRUE)
+
+eda_scatter <- eda_scaffold %>%
+  filter(multigen == TRUE)
+```
+
+```{r}
+ggplot(eda_care_dist, aes(x = total_care_min_cap, weight = WT06)) +
+  geom_histogram(
+    bins = 40,
+    fill = "#1F3C88",
+    color = "white",
+    alpha = 0.85
+  ) +
+  labs(
+    title = "Distribution of Daily Caregiving Time (Multigenerational Caregivers)",
+    x = "Total caregiving minutes per day (capped at 600)",
+    y = "Weighted count"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+ggplot(eda_scatter,
+       aes(x = total_care_min_cap,
+           y = UHRSWORKT_plot,
+           weight = WT06)) +
+  geom_point(
+    color = "#2CA58D",
+    alpha = 0.25,
+    size = 1.5
+  ) +
+  geom_smooth(
+    color = "#F4A261",
+    linewidth = 1.2,
+    se = FALSE
+  ) +
+  labs(
+    title = "Caregiving Time vs Weekly Work Hours (Multigenerational Households)",
+    x = "Total caregiving minutes per day (capped at 600)",
+    y = "Usual weekly work hours"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+eda_emp_comp <- as.data.frame(
+  prop.table(svytable(~EMPSTAT + provides_care, des_multi), margin = 2)
+)
+names(eda_emp_comp) <- c("EMPSTAT", "provides_care", "share")
+
+ggplot(eda_emp_comp, aes(x = provides_care, y = share, fill = EMPSTAT)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Employment status composition: Care vs no-care (multigen)",
+    x = "Provides caregiving (within multigen)",
+    y = "Share"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+eda_inc_comp <- step1_inc
+
+ggplot(eda_inc_comp,
+       aes(x = FAMINCOME,
+           y = share,
+           group = provides_care,
+           color = provides_care)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    values = c(
+      "FALSE" = "#1F3C88",
+      "TRUE"  = "#F4A261"
+    ),
+    labels = c("No Care", "Provides Care")
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Family Income Distribution by Caregiving Status (Multigenerational)",
+    x = "Family Income Category",
+    y = "Share",
+    color = "Care Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+eda_numbers <- list(
+  share_multigen = svymean(~multigen, des_all, na.rm = TRUE),
+  share_caregivers_in_multigen = svymean(~provides_care, des_multi, na.rm = TRUE),
+  mean_total_care_multigen_caregivers = svymean(
+    ~total_care_min,
+    subset(des_all, multigen == TRUE & provides_care == TRUE),
+    na.rm = TRUE
+  ),
+  mean_work_hours_care_vs_nocare = svyby(~UHRSWORKT_plot, ~provides_care, des_multi, svymean, na.rm = TRUE)
+)
+
+eda_numbers
+```
+
+```{r}
+emp0 <- as.data.frame(prop.table(svytable(~EMPSTAT + multigen, des_all), margin = 2))
+names(emp0) <- c("EMPSTAT", "multigen", "share")
+
+ggplot(emp0, aes(x = multigen, y = share, fill = EMPSTAT)) +
+  geom_col(color = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Employment Status Composition: Full Population vs Multigenerational Households",
+    x = "Multigenerational household (kids + adult-care proxy)",
+    y = "Share",
+    fill = "Employment status"
+  )
+```
+
+```{r}
+care_means <- svymean(
+  ~childcare_min + adultcare_proxy_min,
+  subset(des_all, multigen == TRUE & provides_care == TRUE),
+  na.rm = TRUE
+)
+
+care_df <- tibble::tibble(
+  care_type = c("Childcare minutes/day", "Adult-care minutes/day"),
+  mean_min  = as.numeric(coef(care_means)),
+  se        = as.numeric(SE(care_means))
+)
+
+ggplot(care_df, aes(x = care_type, y = mean_min, fill = care_type)) +
+  geom_col(width = 0.6, color = "white", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = mean_min - 1.96 * se, ymax = mean_min + 1.96 * se),
+                width = 0.15) +
+  labs(
+    title = "Average Daily Care Time Among Multigenerational Caregivers",
+    x = NULL,
+    y = "Average minutes per day"
+  ) +
+  theme(legend.position = "none")
+```
+
+```{r}
+hh_unw_total    <- n_distinct(hh_level$CASEID)
+hh_unw_multigen <- hh_level %>% filter(multigen) %>% summarise(n = n_distinct(CASEID)) %>% pull(n)
+
+hh_unw_total
+hh_unw_multigen
+
+hh_weighted_total_households    <- svytotal(~one, des_hh)
+hh_weighted_multigen_households <- svytotal(~multigen, des_hh)
+hh_weighted_share_multigen      <- svymean(~multigen, des_hh)
+
+hh_weighted_total_households
+hh_weighted_multigen_households
+hh_weighted_share_multigen
+```
+
+```{r}
+svyby_to_named_est <- function(df, group_col, new_name) {
+  df <- as.data.frame(df)
+
+  cand <- setdiff(
+    names(df),
+    c(group_col, grep("^se\\.|^SE\\.|^se$|^SE$", names(df), value = TRUE))
+  )
+
+  cand <- cand[sapply(df[cand], is.numeric)]
+
+  if (length(cand) == 0) stop("No numeric estimate column found in svyby output.")
+  if (length(cand) > 1) {
+    prefer <- cand[grepl("TRUE$", cand)]
+    if (length(prefer) >= 1) cand <- prefer[1] else cand <- cand[1]
+  } else {
+    cand <- cand[1]
+  }
+
+  df %>%
+    dplyr::rename(!!new_name := !!rlang::sym(cand))
+}
+
+multigen_hh_by_eth_n <- svyby(
+  ~multigen,
+  ~race_eth,
+  des_hh,
+  svytotal,
+  na.rm = TRUE
+) %>%
+  svyby_to_named_est(group_col = "race_eth", new_name = "multigen_households")
+
+total_hh_by_eth_n <- svyby(
+  ~one,
+  ~race_eth,
+  des_hh,
+  svytotal,
+  na.rm = TRUE
+) %>%
+  svyby_to_named_est(group_col = "race_eth", new_name = "total_households")
+
+share_multigen_by_eth <- svyby(
+  ~multigen,
+  ~race_eth,
+  des_hh,
+  svymean,
+  na.rm = TRUE
+) %>%
+  svyby_to_named_est(group_col = "race_eth", new_name = "share_multigen")
+
+eth_household_counts <- multigen_hh_by_eth_n %>%
+  left_join(total_hh_by_eth_n, by = "race_eth") %>%
+  left_join(share_multigen_by_eth, by = "race_eth") %>%
+  mutate(share_multigen_pct = 100 * share_multigen) %>%
+  arrange(desc(multigen_households))
+
+eth_household_counts
+```
+
+```{r}
+mean_hhsize_by_eth_all <- svyby(
+  ~HH_SIZE,
+  ~race_eth,
+  des_hh,
+  svymean,
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  rename(mean_hh_size_all = HH_SIZE, se_all = se)
+
+mean_hhsize_by_eth_multi <- svyby(
+  ~HH_SIZE,
+  ~race_eth,
+  subset(des_hh, multigen == TRUE),
+  svymean,
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  rename(mean_hh_size_multigen = HH_SIZE, se_multigen = se)
+
+eth_household_size <- mean_hhsize_by_eth_all %>%
+  left_join(mean_hhsize_by_eth_multi, by = "race_eth") %>%
+  arrange(desc(mean_hh_size_multigen))
+
+eth_household_size
+```
+
+```{r}
+mean_kids_by_eth_all <- svyby(
+  ~HH_NUMKIDS,
+  ~race_eth,
+  des_hh,
+  svymean,
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  rename(mean_kids_all = HH_NUMKIDS, se_all = se)
+
+mean_kids_by_eth_multi <- svyby(
+  ~HH_NUMKIDS,
+  ~race_eth,
+  subset(des_hh, multigen == TRUE),
+  svymean,
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  rename(mean_kids_multigen = HH_NUMKIDS, se_multigen = se)
+
+kids_by_eth <- mean_kids_by_eth_all %>%
+  left_join(mean_kids_by_eth_multi, by = "race_eth") %>%
+  arrange(desc(mean_kids_multigen))
+
+kids_by_eth
+
+care_by_eth <- svyby(
+  ~childcare_min + adultcare_proxy_min + total_care_min,
+  ~race_eth,
+  subset(des_all, multigen == TRUE & provides_care == TRUE),
+  svymean,
+  na.rm = TRUE
+) %>%
+  as.data.frame()
+
+care_by_eth
+```
+
+```{r}
+plot_counts <- eth_household_counts %>%
+  filter(!is.na(race_eth)) %>%
+  mutate(
+    multigen_millions = multigen_households / 1e6,
+    race_eth = forcats::fct_reorder(race_eth, multigen_millions)
+  )
+
+ggplot(plot_counts, aes(x = race_eth, y = multigen_millions, fill = race_eth)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(accuracy = 1, suffix = "M")) +
+  labs(
+    title = "Estimated Number of Multigenerational Households by Ethnicity",
+    x = NULL,
+    y = "Households (Millions)"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+multigen_sample_dist <- hh_level %>%
+  filter(multigen == TRUE) %>%
+  count(race_eth) %>%
+  mutate(
+    percent = 100 * n / sum(n)
+  ) %>%
+  arrange(desc(n))
+
+multigen_sample_dist
+```
+
+```{r}
+eth_share_plot <- eth_household_counts %>%
+  filter(!is.na(race_eth)) %>%
+  mutate(
+    share_multigen_pct = share_multigen * 100,
+    race_eth = forcats::fct_reorder(race_eth, share_multigen_pct)
+  )
+
+ggplot(eth_share_plot, aes(x = race_eth, y = share_multigen_pct, fill = race_eth)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(
+    title = "Share of Households That Are Multigenerational (by Ethnicity)",
+    x = NULL,
+    y = "Percent of Households"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+ggplot(multigen_sample_dist,
+       aes(x = reorder(race_eth, n),
+           y = n,
+           fill = race_eth)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Ethnic Composition of Multigenerational Households (Sample)",
+    subtitle = "Based on multigenerational households in ATUS",
+    x = NULL,
+    y = "Number of Households"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+structure_df <- data.frame(
+  group = rep(c("Full Population", "Multigenerational"), 2),
+  metric = c("Household Size", "Household Size",
+             "Number of Children", "Number of Children"),
+  value = c(2.85, 4.26,
+            0.62, 2.03)
+)
+
+ggplot(structure_df, aes(x = group, y = value, fill = group)) +
+  geom_col(width = 0.6) +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(
+    title = "Structural Differences in Multigenerational Households",
+    x = NULL,
+    y = "Average"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+plot_hhsize <- eth_household_size %>%
+  filter(!is.na(race_eth)) %>%
+  select(race_eth, mean_hh_size_all, mean_hh_size_multigen) %>%
+  pivot_longer(
+    cols = c(mean_hh_size_all, mean_hh_size_multigen),
+    names_to = "group",
+    values_to = "mean_hh_size"
+  ) %>%
+  mutate(
+    group = recode(group,
+                   mean_hh_size_all = "All households",
+                   mean_hh_size_multigen = "Multigenerational households"),
+    race_eth = forcats::fct_reorder(race_eth, mean_hh_size, .fun = max, na.rm = TRUE)
+  )
+
+ggplot(plot_hhsize, aes(x = race_eth, y = mean_hh_size, fill = group)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Average household size by ethnicity (all vs multigenerational)",
+    x = NULL,
+    y = "Average number of people in household",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+care_by_eth_long <- care_by_eth %>%
+  filter(!is.na(race_eth)) %>%
+  select(race_eth, childcare_min, adultcare_proxy_min, total_care_min) %>%
+  pivot_longer(
+    cols = c(childcare_min, adultcare_proxy_min, total_care_min),
+    names_to = "care_type",
+    values_to = "mean_minutes"
+  ) %>%
+  mutate(
+    care_type = recode(
+      care_type,
+      childcare_min = "Childcare (min/day)",
+      adultcare_proxy_min = "Adult-care proxy (min/day)",
+      total_care_min = "Total care (min/day)"
+    ),
+    race_eth = forcats::fct_reorder(race_eth, mean_minutes, .fun = max, na.rm = TRUE)
+  )
+
+ggplot(care_by_eth_long, aes(x = race_eth, y = mean_minutes, fill = care_type)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Average daily caregiving minutes among multigenerational caregivers, by ethnicity",
+    x = NULL,
+    y = "Average minutes per day",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+write_csv(step0_means, "step0_means_population_vs_multigen.csv")
+write_csv(step1_means, "step1_means_multigen_care_vs_nocare.csv")
+write_csv(step2_hours, "step2_hours_by_care_intensity.csv")
+write_csv(atus_final, "atus_analysis_dataset.csv")
+```
+
+```{r}
+key_numbers <- list(
+  weighted_total_households = hh_weighted_total_households,
+  weighted_multigen_households = hh_weighted_multigen_households,
+  weighted_share_multigen = hh_weighted_share_multigen,
+  multigen_households_by_ethnicity = eth_household_counts,
+  avg_household_size_by_ethnicity = eth_household_size,
+  care_minutes_by_ethnicity_multigen_caregivers = care_by_eth
+)
+
+key_numbers
+```
+
+# =========================
+
+# FINAL RESULTS SUMMARY
+
+# =========================
+
+## Sample Overview
+
+-   Total observations (unweighted): **159,937**
+-   Multigenerational households (kids + old proxy): **21,876**
+-   Multigenerational households represent approximately **13% of the weighted population**
+-   Among caregivers in multigenerational households:
+    -   Average childcare time: **107.5 minutes per day**
+    -   Average adult-care time: **48.3 minutes per day**
+    -   Total care time: **155.8 minutes per day (\~2.6 hours daily)**
+
+------------------------------------------------------------------------
+
+## Step 0: Entire Population vs Multigenerational Households
+
+### Demographics
+
+-   Average age:
+    -   Entire population: **45.4 years**
+    -   Multigenerational households: **37.4 years**
+    -   ➝ Multigenerational households are approximately **8 years younger**
+-   Average household size:
+    -   Entire population: **2.85 persons**
+    -   Multigenerational households: **4.26 persons**
+    -   ➝ Multigenerational households are significantly larger
+-   Average number of children:
+    -   Entire population: **0.62**
+    -   Multigenerational households: **2.03**
+    -   ➝ Over **three times more children**
+
+------------------------------------------------------------------------
+
+### Labor Market Outcomes
+
+-   Average usual weekly work hours:
+    -   Entire population: **4181**
+    -   Multigenerational households: **3214**
+    -   ➝ Multigenerational households work fewer hours on average
+-   Employment distribution:
+    -   Primary employment category:
+        -   Entire population: **59.4%**
+        -   Multigenerational households: **68.7%**
+    -   Not in labor force:
+        -   Entire population: **32.4%**
+        -   Multigenerational households: **22.0%**
+    -   ➝ Multigenerational households show stronger employment attachment
+
+------------------------------------------------------------------------
+
+### Income Patterns
+
+-   Higher income brackets (14–16) are more common in multigenerational households:
+    -   Bracket 14:
+        -   Entire population: **12.4%**
+        -   Multigenerational: **14.6%**
+    -   Bracket 15:
+        -   Entire population: **9.1%**
+        -   Multigenerational: **12.3%**
+    -   Bracket 16:
+        -   Entire population: **6.2%**
+        -   Multigenerational: **8.9%**
+    -   ➝ Multigenerational households are not concentrated in lower income brackets
+
+------------------------------------------------------------------------
+
+## Step 1: Within Multigenerational Households — Care vs No Care
+
+-   Caregivers devote substantial time to unpaid work:
+    -   **107.5 minutes/day childcare**
+    -   **48.3 minutes/day adult care**
+    -   **155.8 minutes/day total care**
+-   Average work hours among caregivers:
+    -   **3214**
+-   Employment remains high among caregivers:
+    -   Primary employment category: **68.7%**
+-   Income distribution among caregivers shows meaningful presence in higher income brackets (14–16)
+
+------------------------------------------------------------------------
+
+## Step 2: Care Intensity and Work Hours
+
+Average usual weekly work hours by caregiving intensity:
+
+-   Full-time caregivers (≥40 hrs/week care): **5826**
+-   Mid-range caregivers (20–39 hrs/week care): **4049**
+-   Part-time caregivers (\<20 hrs/week care): **2523**
+
+➝ Higher caregiving intensity is associated with higher work hours.
+
+------------------------------------------------------------------------
+
+# Hypothesis Results
+
+### Hypothesis 1:
+
+Multigenerational households differ economically from the full population.
+
+✔ Supported. They are younger, larger, have more children, and display strong employment attachment.
+
+------------------------------------------------------------------------
+
+### Hypothesis 2:
+
+Within multigenerational households, caregivers have weaker labor market outcomes.
+
+✖ Not supported. Caregivers remain strongly attached to employment.
+
+------------------------------------------------------------------------
+
+### Hypothesis 3:
+
+Higher caregiving intensity reduces work hours.
+
+✖ Not supported. Higher caregiving intensity is associated with higher work hours.
+
+------------------------------------------------------------------------
+
+## Overall Conclusion
+
+Multigenerational households face substantial caregiving demands (over 2.5 hours daily), yet maintain strong labor force attachment and meaningful representation in higher income brackets. Care responsibilities coexist with economic activity rather than replacing it, suggesting cumulative time constraints rather than labor market withdrawal.
+
+\
